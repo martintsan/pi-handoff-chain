@@ -1,0 +1,21 @@
+{
+  "name": "pi-handoff-chain",
+  "version": "1.0.0",
+  "description": "Kill & Handoff protocol for pi — checkpointed handoffs, watermark-enforced landing, and fresh-session task chaining for multi-agent workflows",
+  "keywords": ["pi-package", "pi-extension", "multi-agent", "handoff", "context-management", "orchestration"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martintsan/pi-handoff-chain.git"
+  },
+  "homepage": "https://github.com/martintsan/pi-handoff-chain#readme",
+  "bugs": "https://github.com/martintsan/pi-handoff-chain/issues",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

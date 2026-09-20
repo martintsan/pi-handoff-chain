@@ -1,0 +1,5 @@
+node_modules/
+.chain-logs/
+HANDOFF.md
+TASK.md
+*.log
