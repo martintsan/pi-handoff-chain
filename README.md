@@ -189,20 +189,23 @@ The reset engine's behaviour depends on pi event ordering (`turn_end` → `agent
 
 ## Publishing
 
-The package already carries what the pi ecosystem needs: the `pi-package` keyword (which is what the [gallery](https://pi.dev/packages) indexes) and a `pi.extensions` manifest. `publishConfig.access` is `public` and `prepublishOnly` runs the typecheck, so a publish is one command:
+`publishConfig.access` is `public` and `prepublishOnly` runs the typecheck, so a release is one command:
 
 ```bash
-npm login          # interactive, one-time
-npm publish        # runs ./scripts/typecheck.sh first, then publishes pi-handoff-chain@<version>
+npm version patch|minor|major   # bumps package.json and commits + tags locally
+npm publish                     # prepublishOnly typechecks, then ships
+git push && git push --tags     # the tag must land, see below
 ```
 
-Verified prerequisites: the name `pi-handoff-chain` is unclaimed on the registry, all three peer deps resolve publicly (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `typebox`), and the tarball ships only `extensions/`, `scripts/`, `tsconfig.check.json`, `README.md`, `LICENSE`.
+Tag every published version. `pi install git:...@vX` resolves git tags, so a version that exists on npm but not in git is a dead end for anyone pinning the git source — keep `v<version>` tags pointing at the exact commit whose tarball was published.
 
-Gallery listing is automatic — pi.dev/packages displays npm packages tagged `pi-package`, so there is nothing to submit separately. For a preview in the gallery card, add `pi.image` (PNG/JPEG/GIF/WebP) or `pi.video` (MP4) to the `pi` block in `package.json`; both need a hosted URL.
+Gallery listing is automatic: [pi.dev/packages](https://pi.dev/packages) indexes npm packages carrying the `pi-package` keyword, which this package already has — there is nothing to submit separately. The detail page renders the package README, so README edits show up there on the next publish. For a preview in the gallery card, add `pi.image` (PNG/JPEG/GIF/WebP) or `pi.video` (MP4) to the `pi` block in `package.json`; both need a hosted URL.
+
+The catalog page sorts by download volume, so a freshly published package sits far down the list until it accumulates downloads — deep-link to `pi.dev/packages/pi-handoff-chain` rather than expecting the front page.
 
 ### Provenance (CI only)
 
-npm provenance cannot be generated from a local machine — per npm's docs it requires a supported cloud CI provider on a cloud-hosted runner (GitHub Actions or GitLab CI/CD). For that route, publish from GitHub Actions with `permissions: { id-token: write }` and `npm publish --provenance --access public` (or npm trusted publishing, which adds provenance without the flag). Deliberately **not** set in `publishConfig`: `provenance: true` there would make every local `npm publish` fail.
+npm provenance cannot be generated from a local machine — per npm's docs it requires a supported cloud CI provider on a cloud-hosted runner (GitHub Actions or GitLab CI/CD). For that route, publish from GitHub Actions with `permissions: { id-token: write }` and `npm publish --provenance --access public` (or npm trusted publishing, which adds provenance without the flag). Deliberately **not** set in `publishConfig`: `provenance: true` there would make every local `npm publish` fail. Until provenance is set up, `npm audit signatures` verifies the registry signature but finds no attestation for this package.
 
 ## Credits
 
