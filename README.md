@@ -82,6 +82,12 @@ The switch is re-read at `session_start`, at `agent_start`, and immediately afte
 ## Install
 
 ```bash
+pi install npm:pi-handoff-chain
+```
+
+Or straight from git:
+
+```bash
 pi install git:github.com/martintsan/pi-handoff-chain
 ```
 
@@ -176,10 +182,27 @@ This plugin makes handoffs mechanical; it cannot make tasks small enough. Before
 ## Hacking
 
 ```bash
-./scripts/typecheck.sh   # symlink the globally installed pi package + tsc --noEmit
+./scripts/typecheck.sh   # symlink the globally installed pi package (or use the npm peer dep) + tsc --noEmit
 ```
 
 The reset engine's behaviour depends on pi event ordering (`turn_end` → `agent_settled` → compaction), which is documented above and in the source comments; change it with a sandbox RPC session before trusting it.
+
+## Publishing
+
+The package already carries what the pi ecosystem needs: the `pi-package` keyword (which is what the [gallery](https://pi.dev/packages) indexes) and a `pi.extensions` manifest. `publishConfig.access` is `public` and `prepublishOnly` runs the typecheck, so a publish is one command:
+
+```bash
+npm login          # interactive, one-time
+npm publish        # runs ./scripts/typecheck.sh first, then publishes pi-handoff-chain@<version>
+```
+
+Verified prerequisites: the name `pi-handoff-chain` is unclaimed on the registry, all three peer deps resolve publicly (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `typebox`), and the tarball ships only `extensions/`, `scripts/`, `tsconfig.check.json`, `README.md`, `LICENSE`.
+
+Gallery listing is automatic — pi.dev/packages displays npm packages tagged `pi-package`, so there is nothing to submit separately. For a preview in the gallery card, add `pi.image` (PNG/JPEG/GIF/WebP) or `pi.video` (MP4) to the `pi` block in `package.json`; both need a hosted URL.
+
+### Provenance (CI only)
+
+npm provenance cannot be generated from a local machine — per npm's docs it requires a supported cloud CI provider on a cloud-hosted runner (GitHub Actions or GitLab CI/CD). For that route, publish from GitHub Actions with `permissions: { id-token: write }` and `npm publish --provenance --access public` (or npm trusted publishing, which adds provenance without the flag). Deliberately **not** set in `publishConfig`: `provenance: true` there would make every local `npm publish` fail.
 
 ## Credits
 

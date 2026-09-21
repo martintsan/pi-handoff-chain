@@ -4,8 +4,26 @@
   "description": "Kill & Handoff protocol for pi — checkpointed context resets, watermark-enforced landing, and fresh-session task chaining for multi-agent workflows",
   "keywords": ["pi-package", "pi-extension", "multi-agent", "handoff", "context-management", "context-reset", "orchestration"],
   "license": "MIT",
+  "files": [
+    "extensions",
+    "scripts",
+    "tsconfig.check.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
   "scripts": {
-    "typecheck": "./scripts/typecheck.sh"
+    "typecheck": "./scripts/typecheck.sh",
+    "prepublishOnly": "./scripts/typecheck.sh"
   },
   "repository": {
     "type": "git",
