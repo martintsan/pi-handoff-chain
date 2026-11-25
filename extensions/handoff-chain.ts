@@ -1,80 +1,80 @@
 /**
- * handoff-chain.ts — Kill & Handoff 接力协议 for pi
+ * handoff-chain.ts — Kill & Handoff relay protocol for pi
  *
- * 工作流：
- *   1. Agent 干活，任务完成时调用 `finish`（由 promptGuidelines 约束）
- *   2. finish 把交接文档写入磁盘（每个任务线程一份 lane 文档），在会话里渲染
- *      一张简报卡片（进展 + 问题 + 下一步），然后返回 terminate:true
- *      → pi 在工具批次结束后立即停止，不再追加 LLM 输出（杀胜利巡游）
- *   3. 人审查交接文档（人类闸门），满意后输入 /next（多条 lane 时选一条，可指定模型）
- *   4. /next 读取该 lane 的文档 → ctx.newSession() 开全新会话
- *      → 以 handoff 文档为初始上下文 → 自动发送 kickoff 指令继续下一个任务
+ * Workflow:
+ *   1. The agent works and calls `finish` when its contract is met (promptGuidelines enforce it)
+ *   2. finish writes the handoff document to disk (one lane document per work thread), renders a
+ *      brief card in the transcript (progress + issues + next step), then returns terminate:true
+ *      -> pi stops as soon as the tool batch ends and never appends more LLM output (no victory lap)
+ *   3. A human reviews the handoff (the human gate) and runs /next (picking a lane, optionally a model)
+ *   4. /next reads that lane's document -> ctx.newSession() starts a brand-new session
+ *      -> seeded with the handoff document -> sends the kickoff prompt that continues the next task
  *
- * ── v1.3 修的四件事 ────────────────────────────────────────────────
+ * ── The four things v1.3 fixes ─────────────────────────────────────────
  *
- * 1) 多个会话互相覆盖 HANDOFF.md
- *    现在一个会话 = 一条 lane（一个任务线程），文档在 `.pi/handoff/<lane>.md`。
- *    根目录 HANDOFF.md 退化成**自动生成的索引 + 最近活跃 lane 正文**：
- *    老脚本（agent-chain.sh）和 "## Next task" 解析照旧可用。
- *    lane 名解析顺序：显式 lane 参数 > HANDOFF_LANE 环境变量 > 本会话已绑定 >
- *    lane 文档里的 `session:` 行（跨进程 resume）> /next 注入的 `handoff-lane:`
- *    标记 > 会话名 > 首条用户消息。绑定关系也用 pi.appendEntry 存进会话，
- *    所以 fork / resume 之后还能认出自己那条 lane。
+ * 1) Sessions used to overwrite one another's HANDOFF.md
+ *    Now one session = one lane (one work thread) with its document at `.pi/handoff/<lane>.md`.
+ *    The root HANDOFF.md becomes an **auto-generated index plus the body of the most recently
+ *    active lane**, so old scripts (agent-chain.sh) and "## Next task" parsing keep working.
+ *    Lane resolution order: explicit lane parameter > HANDOFF_LANE env > lane already bound to this
+ *    session > the `session:` line inside a lane document (survives a restart) > the `handoff-lane:`
+ *    marker /next injects > session name > first user message. Bindings are also stored with
+ *    pi.appendEntry, so a fork or resume still recognises its own lane.
  *
- * 2) 写完 handoff 会话里没有简述
- *    finish 的 terminate:true 杀掉了"胜利巡游"，副作用是人只看到一句 toast。
- *    现在 finish/checkpoint 自己用 pi.appendEntry + registerEntryRenderer 在
- *    transcript 里渲染简报卡（进展 / 问题 / 下一步 / 产物）：
- *      - 自定义 entry 不进模型上下文 → 不花一个 token
- *      - entry 持久化到会话文件 → 重开会话还在
- *      - headless（pi -p）里 entry 不渲染，同一段文字照样进工具结果，驱动脚本能读
+ * 2) Nothing was summarised in the chat after a handoff landed
+ *    terminate:true kills the victory lap, and the side effect was that the human saw one toast only.
+ *    finish/checkpoint now render a brief card in the transcript themselves with pi.appendEntry +
+ *    registerEntryRenderer (progress / issues / next step / artifacts):
+ *      - custom entries never enter the LLM context, so the card costs zero tokens
+ *      - entries are persisted in the session file, so they survive a resume
+ *      - in headless mode (pi -p) entries do not render, so the same text also goes to the tool result
  *
- * 3) 随手一个很短的 checkpoint 就把会话打断
- *    v1.2 默认 reset=compact：任何 checkpoint 都清一次上下文（实测 11% 上下文时
- *    也照清），文档薄得像便签，reset 完 agent 只能重新摸索，看起来就是"会话被打断"。
- *    v1.3 默认 reset=auto：只有 ①上下文已用到 HANDOFF_RESET_MIN（默认 35%）
- *    ②这份文档厚到能当全部上下文用（summary+next_task ≥ 700 字、next_task ≥ 60 字、
- *    列了 artifacts）时才真的重置，否则退化成"只落盘"并说明原因。
+ * 3) A short, careless checkpoint used to interrupt the session
+ *    v1.2 defaulted to reset=compact: every checkpoint wiped the context (observed at 11% context)
+ *    with a note-thin document, so the agent had to rediscover what it already knew — which reads to
+ *    the human exactly like "the session got interrupted". v1.3 defaults to reset=auto: a reset
+ *    happens only when ① the context is loaded (>= HANDOFF_RESET_MIN, default 35%) and ② the
+ *    document is thick enough to serve as the whole context; otherwise it writes the file and says why.
  *
- * 4) /next 总是回到默认模型
- *    ctx.newSession() 走 createRuntime，模型取 settings 默认值，当前会话的
- *    /model 切换不会带过去。现在 chainToFreshSession 默认**沿用当前会话的模型**，
- *    并支持显式指定：`/next --model <provider/id|模糊名|list|default|inherit>`。
- *    （pi 实测：pi.setModel 在 withSession 里作用于新会话 —— 会话替换时
- *     apply() → rebindSession() → bindCore() 已经把 runtime 动作换绑到新会话；
- *     setup 阶段 sm.appendModelChange() 只写文件、不改运行时状态，不能用来选模型。）
+ * 4) /next always fell back to the default model
+ *    ctx.newSession() goes through createRuntime, which takes the settings default, so a /model
+ *    switch in the current session was lost. chainToFreshSession now **inherits the current model**
+ *    by default and accepts an explicit one: `/next -m <provider/id|fuzzy name|list|default|inherit>`.
+ *    (measured on pi: pi.setModel inside withSession does apply to the new session — session
+ *     replacement runs apply() -> rebindSession() -> bindCore(), which rebinds the runtime actions to
+ *     the new session; sm.appendModelChange() during setup only writes the file, it cannot pick a model.)
  *
- * ── 上下文重置引擎（v1.2 的核心，v1.3 加了 auto 闸门）──────────────
+ * ── Context reset engine (v1.2's core; v1.3 adds the auto gate) ────────
  *
- *   checkpoint 只落盘是**不够**的 —— 同一会话越写越长，文档永远不是上下文的
- *   来源，后面再"重新读一遍文档"时，新的文档要和一整屏陈旧上下文竞争话语权，
- *   接力形同虚设。所以真正里程碑的 checkpoint 必须是**上下文重置点**。
+ *   Checkpointing to disk is **not enough** — the same session keeps growing, the document is never
+ *   the source of the context, and when the agent later "re-reads the doc" the fresh document has to
+ *   compete with a screenful of stale context. A real milestone checkpoint must be a reset point.
  *
- *   四档重置（checkpoint 的 reset 参数，默认 auto）：
- *     auto     只在"划得来"时重置（见上 3）
- *     none     只落盘，不动上下文
- *     compact  就地清空：本轮工具跑完（turn_end，结果已持久化）后触发 compaction，
- *              并用 session_before_compact 把 summary 直接替换成刚写好的 lane 文档。
- *              → 零 LLM 成本的重置：文档本身就是新上下文；
- *                随后 session_compact 后自动推一条"从文档继续"的消息，工作不断线。
- *     session  硬切换：本轮 settle 后以 /cut 拉起全新会话（同 /next，但沿用同一任务）
+ *   Four reset modes (the checkpoint `reset` parameter, default auto):
+ *     auto     resets only when it pays off (see item 3 above)
+ *     none     writes the file and leaves the context alone
+ *     compact  clears in place: once this turn's tools are done (turn_end, results persisted) it
+ *              triggers compaction and, through session_before_compact, replaces the summary with the
+ *              lane document just written. A reset at zero LLM cost: the document *is* the new context;
+ *              after session_compact a "continue from the document" nudge keeps the work unbroken.
+ *     session  hard cut: after settle, /cut starts a brand-new session (like /next, same task)
  *
- *   时序约束（为什么不能在 checkpoint 的 execute 里直接清上下文）：
- *     - 工具的 ctx 是 ExtensionContext，只有 compact()，没有 newSession()；
- *       newSession() 只在命令上下文（ExtensionCommandContext）里可用。
- *     - ctx.compact() 内部会先 abort 当前 run。在 execute 里调用会把正在执行的
- *       工具批次一起打掉，结果可能落不进会话。所以一律延后到 turn_end。
- *     - 会话替换同理延后到 agent_settled（此时 _isAgentRunActive 已为 false），
- *       再通过 sendUserMessage("/cut", {expandPromptTemplates:true}) 走命令通道。
+ *   Timing constraints (why the context cannot be cleared inside the tool's execute):
+ *     - a tool's ctx is an ExtensionContext: it has compact() but no newSession();
+ *       newSession() only exists on the command context (ExtensionCommandContext).
+ *     - ctx.compact() aborts the current run first. Called from execute it takes the running tool
+ *       batch down with it and the result may never reach the session, so it is deferred to turn_end.
+ *     - session replacement is likewise deferred to agent_settled (when _isAgentRunActive is false)
+ *       and dispatched through the command channel with sendUserMessage("/cut", {expandPromptTemplates:true}).
  *
- * 放在 .pi/extensions/handoff-chain.ts（项目级，需项目被信任后加载）
- * 或 ~/.pi/agent/extensions/handoff-chain.ts（全局）
+ * Install as .pi/extensions/handoff-chain.ts (project level, needs the project trusted)
+ * or ~/.pi/agent/extensions/handoff-chain.ts (global).
  *
- * 总开关：settings.json 里的 `enable_handoff`（见下方开关一节）。
- *   优先级：HANDOFF_ENABLED 环境变量 > .pi/settings.json > ~/.pi/agent/settings.json > true
- *   关掉后不是“注册但罢工”，而是对模型不存在：finish/checkpoint 从 active tools
- *   移除（连 promptSnippet / promptGuidelines 一起消失），所有事件处理器 early-return，
- *   /next /cut 拒绝接力。控制面：/handoff [status | on | off] [global|project]。
+ * Master switch: `enable_handoff` in settings.json (see the switch section below).
+ *   Priority: HANDOFF_ENABLED env > .pi/settings.json > ~/.pi/agent/settings.json > true
+ *   Off does not mean "registered but refusing", it means invisible to the model: finish/checkpoint are
+ *   removed from the active tools (taking their promptSnippet / promptGuidelines with them), every event
+ *   handler early-returns, and /next /cut refuse to chain. Control plane: /handoff [status | on | off].
  */
 
 import type {
@@ -96,34 +96,34 @@ import {
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
-/** 根目录的索引文件（保留旧路径，老脚本照旧能解析 "## Next task"） */
+/** Root index file (the old path is kept so scripts still parse "## Next task") */
 const INDEX_FILE = "HANDOFF.md";
 const INDEX_MARK = "<!-- handoff-chain:index -->";
-/** 每条 lane 一份文档：<cwd>/.pi/handoff/<lane>.md */
+/** One document per lane: <cwd>/.pi/handoff/<lane>.md */
 const LANE_DIR = ".pi/handoff";
 const LEGACY_LANE = "legacy";
-/** 会话内简报卡片（自定义 entry，不进模型上下文） */
+/** In-chat brief card (custom entry, never enters the LLM context) */
 const BRIEF_TYPE = "handoff-brief";
-/** lane 绑定关系（会话内持久化，不进模型上下文） */
+/** Lane bindings for this session (persisted per session, never in the LLM context) */
 const LANE_ENTRY_TYPE = "handoff-lane";
-/** 只有这些 pi 内置档位，避免把 thinking 后缀猜错 */
+/** Only these pi built-in levels, so a thinking suffix is never guessed */
 const THINKING_LEVELS = ["minimal", "low", "medium", "high"];
 
-// ── 总开关：settings.json 里的 enable_handoff ──────────────────────
+// ── Master switch: `enable_handoff` in settings.json ──────────────────
 //
-// pi 没有给扩展暴露读 settings 的 API（ExtensionContext 上只有 getSettings()，
-// 命令上下文里才有），但 settings.json 对未知顶层键是透传的，所以扩展自己读自己写。
-// 优先级（高 → 低）：
-//   环境变量 HANDOFF_ENABLED（单次运行覆盖，headless / 测试用）
-//   项目  <cwd>/.pi/settings.json           →  "enable_handoff": true|false
-//   全局  ~/.pi/agent/settings.json          →  "enable_handoff": true|false
-//   默认  true（保持插件一贯行为；要关就显式写 false）
+// pi exposes no settings API to plain extension contexts, but settings.json passes unknown top-level
+// keys through, so the extension reads and writes those files itself.
+// Priority (high -> low):
+//   env HANDOFF_ENABLED (single run: headless / tests)
+//   project  <cwd>/.pi/settings.json           ->  "enable_handoff": true|false
+//   global   ~/.pi/agent/settings.json          ->  "enable_handoff": true|false
+//   default  true (the plugin's long-standing behaviour; write false to switch it off)
 //
-// 关掉之后不是“注册了但罢工”，而是根本不当存在：
-//   - finish / checkpoint 从 active tools 里移除→ 模型看不见，system prompt 里的
-//     promptSnippet / promptGuidelines 也跟着消失
-//   - 所有事件处理器直接 early-return（不会重置上下文、不会推 watermark）
-//   - /next /cut 拒绝接力；/handoff 保留作控制面（on / off / status）
+// Off is not "registered but refusing", it is "invisible to the model":
+//   - finish / checkpoint are removed from the active tool set, so the model never sees them and
+//     their promptSnippet / promptGuidelines disappear from the system prompt with them
+//   - every event handler early-returns (no context resets, no watermark steering)
+//   - /next /cut refuse to chain; /handoff stays as the control plane (on / off / status)
 const SETTINGS_KEY = "enable_handoff";
 const HANDOFF_TOOLS = ["finish", "checkpoint"];
 type Scope = "global" | "project";
@@ -142,11 +142,11 @@ function readSettings(scope: Scope, cwd: string): Record<string, unknown> | null
     const raw = JSON.parse(readFileSync(p, "utf8"));
     return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
   } catch {
-    return null; // 坏文件：不拦，让默认值生效
+    return null; // unreadable file: do not block, let the defaults win
   }
 }
 
-/** 宽容解析：布尔 / "true|false|on|off|yes|no|1|0"；认不出就返回 undefined（交给下一级） */
+/** Lenient parse: booleans or "true|false|on|off|yes|no|1|0"; undefined when unrecognised */
 function parseBool(v: unknown): boolean | undefined {
   if (typeof v === "boolean") return v;
   if (typeof v === "string") {
@@ -167,7 +167,7 @@ function resolveEnabled(cwd: string): { enabled: boolean; source: string } {
   return { enabled: true, source: "default (key absent)" };
 }
 
-/** 读-改-写，只动一个键，其他设置原样保留 */
+/** Read-modify-write: touches only this one key and preserves every other setting */
 function writeEnabled(scope: Scope, cwd: string, value: boolean): { path: string; error?: string } {
   const p = settingsPath(scope, cwd);
   try {
@@ -181,34 +181,36 @@ function writeEnabled(scope: Scope, cwd: string, value: boolean): { path: string
   }
 }
 
-// ── 阈值 ────────────────────────────────────────────────────────────
-// 水位线：上下文用到窗口的 60% 就强制落盘（留出写完交接+余量）
+// ── Thresholds ─────────────────────────────────────────────────────────
+// Watermark: force landing at 60% of the window (leaves room to write the handoff + slack)
 const WATERMARK = Number(process.env.HANDOFF_WATERMARK ?? 0.6);
 
-// checkpoint 默认重置档位：auto | none | compact | session
+// Default checkpoint reset mode: auto | none | compact | session
 type ResetKind = "none" | "compact" | "session";
 type ResetChoice = ResetKind | "auto";
 const DEFAULT_RESET: ResetChoice = pickReset(process.env.HANDOFF_CHECKPOINT_RESET, "auto");
 
-// 熔断：单次会话里自动重置的次数上限（防止 agent 每轮都 checkpoint 造成 复位→重启 抖动）
+// Circuit breaker: max automatic resets per session (stops a reset/resume ping-pong)
 const MAX_RESETS = Number(process.env.HANDOFF_MAX_RESETS ?? 12);
 
-// 重置下限：上下文用到窗口的这个比例以下，重置纯属自残（清掉的多、留下的少）
+// Reset floor: below this share of the window a reset is self-harm (it drops more than it keeps)
 const RESET_MIN = Number(process.env.HANDOFF_RESET_MIN ?? 0.35);
-// 文档厚度下限：重置后这份文档就是全部上下文，太薄等于把 agent 推回零状态重新摸索
+// Document thickness floor: after a reset this document IS the whole context, so a thin one
+// would drop the agent back to square one (v1.2's failure mode)
 const RESET_MIN_DOC_CHARS = Number(process.env.HANDOFF_RESET_MIN_DOC_CHARS ?? 700);
 const RESET_MIN_NEXT_CHARS = Number(process.env.HANDOFF_RESET_MIN_NEXT_CHARS ?? 60);
 
-// /next /cut 默认沿用当前会话的模型（"inherit"）；"default" 恢复 v1.2 的“回到 settings 默认模型”
+// /next /cut inherit the current session model ("inherit"); "default" restores the settings default
 const CHAIN_MODEL = (process.env.HANDOFF_CHAIN_MODEL ?? "inherit").trim().toLowerCase();
 
 function pickReset(v: string | undefined, fallback: ResetChoice): ResetChoice {
   return v === "none" || v === "compact" || v === "session" || v === "auto" ? v : fallback;
 }
 
-// ── lanes：一个会话一条工作线程 ────────────────────────────────────
+// ── Lanes: one work thread per session ───────────────────────────────
 //
-// lane 文档尾部是机器可读区（最后一个 `---` 之后的 key: value），索引就靠它生成。
+// The trailer of a lane document (the key: value lines after the last `---`) is the machine-readable
+// block the root index is generated from.
 interface LaneMeta {
   lane: string;
   file: string;
@@ -222,14 +224,14 @@ interface LaneMeta {
   doc: string;
 }
 
-/** 本会话绑定的 lane；key = 会话文件路径（或 cwd 兜底） */
+/** Lane bound to this session; key = session file path (cwd as fallback) */
 const laneBindings = new Map<string, string>();
-/** /next 注入的 `handoff-lane:` 标记（跨进程时靠 lane 文档的 session: 行兜底） */
+/** `handoff-lane:` markers injected by /next (cross-process fallback: the lane's session: line) */
 const injectedLanes = new Map<string, string>();
 let migrationsDone = false;
-/** 最近一次已知 cwd，只给 /next /handoff 的参数补全用 */
+/** Last known cwd, only used for /next and /handoff argument completion */
 let lastCwd = process.cwd();
-/** setup 里算好、传给新会话的 lane（withSession 时写入 injectedLanes） */
+/** Lane computed in setup() for the chained session, handed to withSession to record */
 let pendingLaneForChild: string | null = null;
 
 function laneDir(cwd: string): string {
@@ -242,7 +244,7 @@ function sessionKey(ctx: ExtensionContext | ExtensionCommandContext): string {
   return ctx.sessionManager.getSessionFile?.() ?? `cwd:${ctx.cwd}`;
 }
 
-/** ASCII 化 slug（lane 名要能当文件名，也要好打在 /next 后面） */
+/** ASCII slug: a lane name has to work as a file name and be easy to type after /next */
 function slugify(raw: string): string {
   const s = (raw || "")
     .toLowerCase()
@@ -266,7 +268,7 @@ function hash4(s: string): string {
 const LANE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const LANE_MARKER_RE = /^handoff-lane:\s*([a-z0-9][a-z0-9._-]{0,63})\s*$/im;
 
-/** 解析 lane 文档尾部的 key: value 区（找不到就当空对象） */
+/** Parse the key: value trailer of a lane document (empty object when there is none) */
 function parseTrailer(doc: string): Record<string, string> {
   const i = doc.lastIndexOf("\n---\n");
   if (i < 0) return {};
@@ -322,7 +324,7 @@ function readLane(cwd: string, lane: string): LaneMeta | null {
   };
 }
 
-/** 全部 lane，按最近活跃排序 */
+/** Every lane, most recently active first */
 function listLanes(cwd: string): LaneMeta[] {
   const dir = laneDir(cwd);
   if (!existsSync(dir)) return [];
@@ -350,8 +352,8 @@ function isLaneOpen(l: LaneMeta): boolean {
 }
 
 /**
- * 生成根目录 HANDOFF.md：表格式索引 + 最近活跃 lane 的正文。
- * 保留 "## Status" / "## Next task" 段落形状，老脚本（agent-chain.sh）照旧能解析。
+ * Generates the root HANDOFF.md: a table index plus the body of the most recently active lane.
+ * The "## Status" / "## Next task" shape is preserved so old scripts (agent-chain.sh) still parse it.
  */
 function renderIndex(cwd: string, lanes: LaneMeta[]): string {
   const now = new Date().toISOString();
@@ -399,7 +401,7 @@ function renderIndex(cwd: string, lanes: LaneMeta[]): string {
   ].join("\n");
 }
 
-/** 是否是本扩展生成的索引（而不是某个手写的 / 旧版单文件 HANDOFF.md） */
+/** Is this an index this extension generated (as opposed to a hand-written or legacy single file)? */
 function looksLikeIndex(doc: string): boolean {
   return doc.includes(INDEX_MARK) || /^#\s*HANDOFF index\b/m.test(doc);
 }
@@ -412,7 +414,7 @@ function trailerOf(doc: string, key: string): string {
   return parseTrailer(doc)[key] ?? "";
 }
 
-/** 把旧的单文件 HANDOFF.md 收进 .pi/handoff/legacy.md（每个进程只做一次） */
+/** Move a legacy single HANDOFF.md into .pi/handoff/legacy.md (once per process) */
 function migrateLegacy(cwd: string, ctx: ExtensionContext | ExtensionCommandContext): void {
   if (migrationsDone) return;
   migrationsDone = true;
@@ -425,7 +427,7 @@ function migrateLegacy(cwd: string, ctx: ExtensionContext | ExtensionCommandCont
   } catch {
     return;
   }
-  if (!isLaneDocText(doc)) return; // 手写的、空的、或者已经不是交接文档：别乱动
+  if (!isLaneDocText(doc)) return; // hand-written or empty: leave it alone
   try {
     mkdirSync(dir, { recursive: true });
     const session = trailerOf(doc, "previous-session") || "unknown";
@@ -439,7 +441,7 @@ function migrateLegacy(cwd: string, ctx: ExtensionContext | ExtensionCommandCont
       "info",
     );
   } catch {
-    /* 迁移失败不拦主流程 */
+    /* a failed migration must never block the main path */
   }
 }
 
@@ -455,7 +457,7 @@ function extractText(content: unknown): string {
     .join("\n");
 }
 
-/** 从会话内容里推 lane 名：注入标记 > 会话名 > 首条用户消息 */
+/** Derive a lane name from session content: injected marker > session name > first user message */
 function deriveLane(ctx: ExtensionContext | ExtensionCommandContext): string {
   const key = sessionKey(ctx);
   const injected = injectedLanes.get(key);
@@ -471,13 +473,13 @@ function deriveLane(ctx: ExtensionContext | ExtensionCommandContext): string {
       if (!text.trim()) continue;
       const marker = LANE_MARKER_RE.exec(text);
       if (marker) return marker[1];
-      // 链式注入 / checkpoint 重置注入不算“任务描述”
+      // chained handoff / checkpoint-reset injections are not a task description
       if (/^<(handoff-from-previous-session|checkpoint-handoff)\b/i.test(text.trim())) continue;
       readable = slugify(text.slice(0, 160));
       break;
     }
   } catch {
-    /* getBranch 拿不到就走兜底 */
+    /* if getBranch is unavailable, fall through to the defaults */
   }
 
   try {
@@ -493,11 +495,11 @@ function deriveLane(ctx: ExtensionContext | ExtensionCommandContext): string {
   if (!existing) return readable;
   if (existing.session && existing.session === own) return readable;
   const recent = Date.now() - existing.mtime < 24 * 3600 * 1000;
-  // 名字被另一条还活跃的线程占了 → 带会话指纹，避免互相覆盖
+  // the readable name is taken by another live thread -> add a session fingerprint, no clobbering
   return recent ? `${readable}-${hash4(own)}` : readable;
 }
 
-/** 确定本会话的 lane（并绑定） */
+/** Decide this session's lane (and bind it) */
 function resolveLane(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -519,7 +521,7 @@ function resolveLane(
     if (lane) source = "bound";
   }
   if (!lane) {
-    // 跨进程 resume：lane 文档里记着是谁写的
+    // cross-process resume: each lane document records which session wrote it
     const mine = listLanes(cwd).find((l) => l.session && l.session === own);
     if (mine) {
       lane = mine.lane;
@@ -536,17 +538,17 @@ function resolveLane(
   const known = laneBindings.get(key);
   laneBindings.set(key, lane);
   if (known !== lane) {
-    // 只在绑定发生变化时留一条 entry，别把会话文件刷满
+    // record the binding only when it changes, so the session file is not spammed
     try {
       pi.appendEntry(LANE_ENTRY_TYPE, { lane, source, at: Date.now() });
     } catch {
-      /* entry 不可写就只留内存绑定 */
+      /* if entries cannot be written, keep the in-memory binding only */
     }
   }
   return { lane, file: lanePath(cwd, lane), source };
 }
 
-/** 写 lane 文档 + 重建根索引 */
+/** Write the lane document and rebuild the root index */
 function writeLaneDoc(cwd: string, lane: string, doc: string): string {
   mkdirSync(laneDir(cwd), { recursive: true });
   const file = lanePath(cwd, lane);
@@ -554,12 +556,12 @@ function writeLaneDoc(cwd: string, lane: string, doc: string): string {
   try {
     writeFileSync(join(cwd, INDEX_FILE), renderIndex(cwd, listLanes(cwd)), "utf8");
   } catch {
-    /* 索引写失败不影响 lane 文档本身 */
+    /* a failing index write must not affect the lane document itself */
   }
   return file;
 }
 
-/** 保留 lane 文档最初的创建时间（标题行的时间戳） */
+/** Keep the lane document's original creation time (the title line's timestamp) */
 function createdOf(file: string, fallback: string): string {
   try {
     const first = readFileSync(file, "utf8").split("\n")[0] ?? "";
@@ -569,7 +571,7 @@ function createdOf(file: string, fallback: string): string {
   }
 }
 
-// ── 会话内简报 ─────────────────────────────────────────────────────
+// ── In-chat brief ────────────────────────────────────────────────────
 
 interface BriefData {
   kind: "finish" | "checkpoint";
@@ -596,40 +598,40 @@ function broadcast(pi: ExtensionAPI, ctx: ExtensionContext, b: BriefData): void 
   try {
     pi.appendEntry(BRIEF_TYPE, b);
   } catch {
-    /* headless 或 entry 不可写：文字仍然在工具结果里 */
+    /* headless or unwritable entry: the text is still in the tool result */
   }
   ctx.ui.notify(b.head || briefText(b), b.status === "blocked" ? "warning" : "info");
 }
 
-// ── 看门狗 / 重置引擎状态（进程内，session_start 时全部清零）───────
+// ── Watchdog / reset engine state (in-process, all cleared on session_start) ──
 //
-// 状态机（时序全是实测出来的，不是猜的）：
+// State machine (every ordering below was measured on pi, not assumed):
 //   checkpoint.execute   → armed = { kind, doc, file, lane }
-//   turn_end             → compact: resetSummary 定弹 + ourCompactInFlight=true + ctx.compact()
-//   session_before_compact→ 用 resetSummary 顶替默认 summary（零 LLM 成本）
-//   session_compact/_failed → 清旗，然后等 idle 推 RESUME
-//   agent_settled         → compact 的 abort 会先 settle（实测），所以这里只做兜底；
-//                          session 档在这里派发 /cut
+//   turn_end             -> compact: park resetSummary + ourCompactInFlight=true + ctx.compact()
+//   session_before_compact-> replace the default summary with resetSummary (zero LLM cost)
+//   session_compact/_failed -> clear the flags, then wait for idle before the RESUME message
+//   agent_settled         -> a compact abort settles first (measured), so this is only a backstop;
+//                          the session mode dispatches /cut here
 //
-// ⚠ 实测的两个坑（曾导致重置“看起来没生效”）：
-//   1) ctx.compact() 是 fire-and-forget，session_before_compact 在 agent_settled **之后**才跑。
-//      所以喂给 compaction 的文档必须单独存在 resetSummary 里，不能被 settle 处理器清掉。
-//   2) compaction 进行中 `pi.sendUserMessage()` 会直接报错：
-//      "Cannot submit a prompt while compaction is in progress"。
-//      所有重启消息必须先 whenIdle()，不能 setTimeout(0) 就发。
+// ⚠ Two measured traps (they used to make resets look like they never happened):
+//   1) ctx.compact() is fire-and-forget and session_before_compact runs **after** agent_settled, so the
+//      document fed to compaction is parked in its own resetSummary variable that settle cannot clear.
+//   2) while compaction is in flight pi.sendUserMessage() throws:
+//      "Cannot submit a prompt while compaction is in progress",
+//      so every restart message has to go through whenIdle(), never a bare setTimeout(0).
 let watchdogFired = false;
 
-/** 总开关的当前生效值（session_start / agent_start / /handoff 时刷新） */
+/** Current value of the switch (refreshed on session_start / agent_start / /handoff) */
 let enabled = true;
 let enabledSource = "default (key absent)";
-/** 开关关掉时我们主动从 active tools 里摸掉的工具，开关打开时只送回这些 */
+/** Tools this extension removed from the active set while switched off; only those get restored */
 let hiddenBySwitch: string[] = [];
 
 /**
- * 重读开关，并同步工具可见性。
- * 只在 session_start / agent_start / 手动 /handoff 时调：
- * 不在 before_agent_start 里改——那一轮的工具 loadout 正在算，容易抢跑。
- * 改完 settings.json 后，下一轮 run / 下一个会话生效，或者直接 /handoff on|off。
+ * Re-reads the switch and keeps tool visibility in sync.
+ * Called from session_start / agent_start / a manual /handoff only:
+ * never from before_agent_start, where that turn's tool loadout is being computed and it races.
+ * After editing settings.json it takes effect on the next run/session, or right away via /handoff on|off.
  */
 function syncEnabled(pi: ExtensionAPI, ctx: ExtensionContext): void {
   const r = resolveEnabled(ctx.cwd);
@@ -651,11 +653,11 @@ function syncEnabled(pi: ExtensionAPI, ctx: ExtensionContext): void {
       hiddenBySwitch = [];
     }
   } catch {
-    // 拿不到工具列表也不能让开关并置错
+    // failing to read the tool list must not corrupt the switch state
   }
 
   if (was && !enabled) {
-    // 关闸：把还在飞的重置/看门狗全抹掉
+    // switch off: drop anything still in flight (resets, watchdog)
     disarm();
     ourCompactInFlight = false;
     watchdogFired = false;
@@ -671,19 +673,19 @@ function disabledMessage(scopeHint = true): string {
   );
 }
 
-/** 已落盘、等待执行的 reset（在 turn_end 消费） */
+/** Landed snapshot with a reset waiting to run (consumed at turn_end) */
 let armed: { kind: "compact" | "session"; doc: string; file: string; lane: string } | null = null;
-/** 本轮重置的上下文正文；单独保存，不能跟着 armed 一起被 settle 清掉 */
+/** The document handed to compaction; kept separate so settle cannot clear it along with armed */
 let resetSummary: string | null = null;
-/** true = 正在跑我们自己发起的 compaction（用来把 summary 换成 handoff 文档） */
+/** true = a compaction we started ourselves is running (its summary is replaced by the handoff doc) */
 let ourCompactInFlight = false;
-/** compact 完成后需要把 agent 重新推起来 */
+/** after compaction the agent has to be pushed back into work */
 let awaitingResume = false;
-/** settle 后需要发起 /cut（全新会话） */
+/** a /cut (brand-new session) is due once the run settles */
 let awaitingCut = false;
-/** /cut 是由 checkpoint 自动触发的，跳过人工确认 */
+/** /cut was armed by the checkpoint tool, so the human confirmation is skipped */
 let cutArmedByTool = false;
-/** 本会话已自动重置次数（熔断用） */
+/** automatic resets done in this session (circuit breaker) */
 let resetCount = 0;
 let activeLaneFile: string | null = null;
 let activeLaneName = "";
@@ -696,8 +698,8 @@ function disarm(): void {
 }
 
 /**
- * 等到完全空闲（无 run、无 compaction、无重试）再执行。
- * compaction 会话内是异步的，比 agent_settled 更晚结束，必须轮询。
+ * Wait until the session is completely idle (no run, no compaction, no retry) before acting.
+ * Compaction is asynchronous inside the session and outlives agent_settled, so this must poll.
  */
 function whenIdle(
   ctx: ExtensionContext,
@@ -784,9 +786,9 @@ validator: handoff written via finish/checkpoint tool
 }
 
 /**
- * 把 handoff 文档变成"重置后的上下文正文"。
- * 作为 compaction 的 summary 注入 → 旧对话被丢弃，文档成为唯一可信记录。
- * 因为 summary 是我们自己写的，这一步不花任何 LLM token。
+ * Turns the handoff document into "the context body after a reset".
+ * Injected as the compaction summary: the old conversation is dropped and the document becomes the
+ * only trustworthy record. We wrote the summary ourselves, so this costs zero LLM tokens.
  */
 function handoffAsContext(doc: string, file: string): string {
   return [
@@ -811,17 +813,17 @@ function resumeMessage(file: string): string {
   ].join(" ");
 }
 
-// ── 模型选择（/next /cut）──────────────────────────────────────────
+// ── Model selection (/next /cut) ─────────────────────────────────────
 //
-// ctx.newSession() 内部 createRuntime 取 settings 默认模型，当前会话的 /model
-// 切换不会跟过去（v1.2 的痛点）。这里显式把模型搬进新会话：
-//   - setup 阶段 sm.appendModelChange() 只写会话文件，不改运行时 → 只用于留痕
-//   - withSession 阶段 pi.setModel(realModelObject) 才真的作用在新会话上
-//     （会话替换时 apply() → rebindSession() 已经把 runtime 动作换绑到新会话）
-//   - Model 对象必须来自 ctx.modelRegistry.find(provider, id)（官方 docs 的用法），
-//     不能自己拼 {provider, id}：pi.setModel 还要 api / baseUrl / capabilities 等字段
-
-/** 真实 Model 对象类型：从 pi 自己的签名里取，避免手搓 */
+// ctx.newSession() builds the new session from the settings default model, so a /model switch in the
+// current session used to be lost (v1.2's complaint). The chain now carries a model over:
+//   - setup()'s sm.appendModelChange() only records it in the session file and does not change the
+//     runtime, so it is bookkeeping only
+//   - pi.setModel(realModelObject) in withSession() is what actually applies to the new session
+//     (session replacement rebinds the runtime actions via apply() -> rebindSession())
+//   - the Model object must come from ctx.modelRegistry.find(provider, id) (the documented way);
+//     a hand-rolled {provider, id} is not enough: pi.setModel also needs api / baseUrl / capabilities
+/** Real Model type, taken from pi's own signature instead of being invented here */
 type ModelHandle = Parameters<ExtensionAPI["setModel"]>[0];
 type ThinkingHandle = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
 
@@ -855,7 +857,7 @@ interface ModelRef {
   id: string;
 }
 
-/** 可选模型清单：当前模型 + scopedModels + registry 里已配好鉴权的 */
+/** Candidate list: current model + scopedModels + whatever the registry has auth configured for */
 function modelRefs(ctx: ExtensionContext | ExtensionCommandContext): ModelRef[] {
   const out: ModelRef[] = [];
   const push = (m: { provider?: string; id?: string } | undefined | null) => {
@@ -885,7 +887,7 @@ function modelRefs(ctx: ExtensionContext | ExtensionCommandContext): ModelRef[] 
   });
 }
 
-/** 用官方 registry 拿到真正的 Model 对象（找不到返回 undefined） */
+/** Fetch the real Model object from the official registry (undefined when it is not there) */
 function lookupModel(
   ctx: ExtensionContext | ExtensionCommandContext,
   provider: string,
@@ -906,7 +908,7 @@ interface ModelTarget {
   candidates?: string[];
 }
 
-/** 解析 spec → 目标模型；"default"/"settings" 返回空（用 settings 默认），"inherit" 用当前模型 */
+/** Resolve a spec: "default"/"settings" -> use the settings default, "inherit" -> the current model */
 function findModel(
   ctx: ExtensionContext | ExtensionCommandContext,
   spec: string,
@@ -916,8 +918,8 @@ function findModel(
   if (s === "inherit" || s === "current") {
     if (!ctx.model) return {};
     const cur = ctx.model as ModelHandle & ModelRef;
-    // ctx.model 本身就是 registry 里的真 Model，直接当 handle 用；
-    // 再查一次 registry 只是为了拿到更完整的对象（有则更好，无则用当前）。
+    // ctx.model already IS a real Model from the registry, so use it directly as the handle;
+    // the extra registry lookup only tries to get the fuller object (better if found).
     return { ref: { provider: cur.provider, id: cur.id }, handle: lookupModel(ctx, cur.provider, cur.id) ?? cur };
   }
   const parsed = parseModelSpec(s);
@@ -942,7 +944,7 @@ function findModel(
   }
   const ref = fuzzy[0] ?? (parsed.provider ? { provider: parsed.provider, id: parsed.id } : undefined);
   if (!ref) return { error: `no model matching "${s}"`, candidates: refs.slice(0, 8).map((m) => `${m.provider}/${m.id}`) };
-  // registry 里有就必须拿真 Model；拿不到说明这个 provider/id 不存在或没配鉴权
+  // when the registry is reachable it must resolve the Model; a miss means an unknown id or no auth
   const handle = lookupModel(ctx, ref.provider, ref.id);
   if (!handle && ctx.modelRegistry) {
     return {
@@ -953,7 +955,7 @@ function findModel(
   return { ref, handle, thinking };
 }
 
-/** 共享的"开新会话接力"逻辑：/next 与 /cut 都走这里 */
+/** Shared "chain into a fresh session" logic: both /next and /cut go through here */
 async function chainToFreshSession(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
@@ -967,7 +969,7 @@ async function chainToFreshSession(
     modelSpec?: string;
   },
 ): Promise<void> {
-  // 模型先解析（解析失败就别切会话）
+  // resolve the model first: a bad spec must not switch sessions
   const spec = (opts.modelSpec ?? CHAIN_MODEL).trim();
   let target: ModelTarget = {};
   if (spec && spec !== "default" && spec !== "settings") {
@@ -991,7 +993,7 @@ async function chainToFreshSession(
     if (!ok) return;
   }
 
-  // 若在 agent 还在跑时下达指令，先等它 settle，避免会话替换冲突
+  // if the command arrived while the agent was running, settle first to avoid a replacement conflict
   await ctx.waitForIdle();
 
   const parentSession = ctx.sessionManager.getSessionFile?.() ?? undefined;
@@ -1018,12 +1020,12 @@ async function chainToFreshSession(
         content: [{ type: "text", text: inject }],
         timestamp: Date.now(),
       });
-      // 留痕用：真正的运行时切换在 withSession 里用 pi.setModel 做
+      // bookkeeping only: the real runtime switch happens in withSession via pi.setModel
       if (ref) {
         try {
           sm.appendModelChange(ref.provider, ref.id);
         } catch {
-          /* 新会话的 sm 可能不暴露 appendModelChange，忽略 */
+          /* the new session's sm may not expose appendModelChange; ignore */
         }
       }
       try {
@@ -1045,8 +1047,8 @@ async function chainToFreshSession(
       if (childKey) injectedLanes.set(childKey, lane);
       else pendingLaneForChild = lane;
 
-      // 模型：会话替换已经把这批 runtime 动作换绑到新会话，pi.setModel 落在新会话上。
-      // Model 对象必须是 ctx.modelRegistry.find() 返回的那个（带 api/baseUrl/capabilities）。
+      // Model: session replacement already rebound the runtime actions, so pi.setModel lands on the
+      // new session. The object must be the one ctx.modelRegistry.find() returned.
       if (ref && target.handle) {
         try {
           const ok = await pi.setModel(target.handle);
@@ -1069,7 +1071,7 @@ async function chainToFreshSession(
         try {
           pi.setThinkingLevel(thinking);
         } catch {
-          /* 模型不支持就算了 */
+          /* the model may not support that level; fine */
         }
       }
       pendingLaneForChild = null;
@@ -1102,8 +1104,8 @@ function makeKickoff(doc: string, file: string, override?: string, resumeNote?: 
 }
 
 /**
- * 解析 `/next [lane] [-m <model>] ...` 之类的参数里的模型选项。
- * 支持：`--model x` / `--model=x` / `-m x` / `@x` / `model=x` / 裸 `--model`（打开选择器）
+ * Pulls the model option out of args like `/next [lane] [-m <model>] ...`.
+ * Supported: `--model x` / `--model=x` / `-m x` / `@x` / `model=x` / bare `--model` (opens the picker)
  */
 async function takeModelArg(
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -1165,7 +1167,7 @@ async function takeModelArg(
   return { modelArg, rest };
 }
 
-/** 从工具参数拼一段给人看的简报（进展 + 问题 + 下一步） */
+/** Builds the human-readable brief out of the tool arguments (progress + issues + next step) */
 function buildBrief(p: {
   kind: "finish" | "checkpoint";
   lane: string;
@@ -1186,15 +1188,15 @@ function buildBrief(p: {
         .map((l) => l.trim())
         .filter(Boolean)
     : [
-        `进展: ${oneLine(p.summary, 320)}`,
-        p.status === "blocked" || p.blocked ? `问题: ${oneLine(p.blocked || "see the document", 240)}` : `问题: none`,
+        `Progress: ${oneLine(p.summary, 320)}`,
+        p.status === "blocked" || p.blocked ? `Issues: ${oneLine(p.blocked || "see the document", 240)}` : `Issues: none`,
         p.nextTask && !isChainEnd(p.nextTask)
-          ? `下一步: ${oneLine(p.nextTask, 240)}`
-          : `下一步: (chain ends here)`,
+          ? `Next: ${oneLine(p.nextTask, 240)}`
+          : `Next: (chain ends here)`,
       ].filter(Boolean);
-  if (p.artifacts?.length) lines.push(`产物: ${p.artifacts.slice(0, 6).join(", ")}`);
+  if (p.artifacts?.length) lines.push(`Artifacts: ${p.artifacts.slice(0, 6).join(", ")}`);
   if (p.note) lines.push(p.note);
-  const head = `${p.kind === "finish" ? "落盘" : "存档"} · ${p.lane} · ${p.status}${
+  const head = `${p.kind === "finish" ? "landed" : "snapshot"} · ${p.lane} · ${p.status}${
     p.contextPct ? ` · ctx ${p.contextPct}` : ""
   }`;
   return {
@@ -1208,7 +1210,7 @@ function buildBrief(p: {
   };
 }
 
-/** 这份 checkpoint 厚到能当全部上下文用吗？薄就别拿它去覆盖上下文 */
+/** Is this checkpoint thick enough to serve as the whole context? If not, do not reset with it */
 function thinDocument(p: {
   summary: string;
   nextTask?: string;
@@ -1232,7 +1234,7 @@ function thinDocument(p: {
 }
 
 export default function (pi: ExtensionAPI) {
-  // 简报卡片：finish / checkpoint 落盘后人在 transcript 里看到的那张卡
+  // the brief card: what the human sees in the transcript after finish / checkpoint
   pi.registerEntryRenderer<BriefData>(BRIEF_TYPE, (entry, { expanded }, theme) => {
     const d = entry.data;
     if (!d) return new Text(theme.fg("dim", "[handoff] no data"), 0, 0);
@@ -1256,15 +1258,15 @@ export default function (pi: ExtensionAPI) {
     return box;
   });
 
-  // 每一轮 run 重新开始计警告（重置后的 resume 也是一轮新 run），并刷新开关
+  // each run re-arms the warning (the post-reset resume is a new run too) and refreshes the switch
   pi.on("agent_start", async (_event, ctx) => {
     watchdogFired = false;
     lastCwd = ctx.cwd;
     syncEnabled(pi, ctx);
   });
 
-  // 每次会话开始（含 /new、/resume、/cut、/next 之后的新会话）先读开关，
-  // 再清空进程内残留状态——否则上一个会话遗留的 armed reset 会把新会话立刻打去 compaction。
+  // every session_start (/new, /resume, /cut, and the session /next just created): read the switch first,
+  // then drop leftover in-process state — an armed reset from the previous session would compact the new one.
   pi.on("session_start", async (_event, ctx) => {
     syncEnabled(pi, ctx);
     lastCwd = ctx.cwd;
@@ -1279,7 +1281,7 @@ export default function (pi: ExtensionAPI) {
       injectedLanes.set(key, pendingLaneForChild);
       pendingLaneForChild = null;
     }
-    // 恢复本会话的 lane 绑定：本扩展写过的 handoff-lane entry（fork / resume 之后仍有效）
+    // restore this session's lane binding from our own handoff-lane entries (survives fork / resume)
     try {
       for (const e of ctx.sessionManager.getEntries()) {
         if (e.type === "custom" && (e as { customType?: string }).customType === LANE_ENTRY_TYPE) {
@@ -1288,9 +1290,9 @@ export default function (pi: ExtensionAPI) {
         }
       }
     } catch {
-      /* entry 读不到就算了，写的时候再推 */
+      /* if entries are unreadable, the write path re-derives the lane anyway */
     }
-    // /next 注入的 handoff-lane 标记（跨进程 resume 的兜底）
+    // the handoff-lane marker /next injected (fallback when the process changed)
     if (!laneBindings.has(key)) {
       try {
         for (const e of ctx.sessionManager.getBranch()) {
@@ -1312,7 +1314,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── 1. finish 工具：交接落盘 + 会话内简报 + 立刻终止本会话 ──────
+  // ── 1. finish tool: land the handoff, broadcast the brief, terminate the session ──
   pi.registerTool({
     name: "finish",
     label: "Finish & Handoff",
@@ -1382,8 +1384,8 @@ export default function (pi: ExtensionAPI) {
       activeLaneFile = file;
       activeLaneName = lane;
 
-      // finish = 终止。清掉任何待执行的重置，否则 terminate 之后的 turn_end
-      // 还会把这一会话拖去 compaction，纯属浪费。
+      // finish = terminate. Clear anything pending, otherwise the turn_end after terminate
+      // would drag this session into a compaction for nothing.
       disarm();
       ourCompactInFlight = false;
 
@@ -1416,14 +1418,14 @@ export default function (pi: ExtensionAPI) {
           },
         ],
         details: { path: file, lane, status: status, hasNext },
-        // ★ 核心：terminate → 本工具批次结束后不再追加 LLM 输出。
-        //   这就是 "杀进程不等胜利巡游" 的 pi 原生等价物。
+        // ★ the core: terminate -> no extra LLM output after this tool batch ends.
+        //   this is pi's native equivalent of "kill the process, do not wait for the victory lap".
         terminate: true,
       };
     },
   });
 
-  // ── 1b. checkpoint 工具：落盘 = 上下文重置点（非终止）──────────
+  // ── 1b. checkpoint tool: land a snapshot = context reset point (non-terminal) ──
   pi.registerTool({
     name: "checkpoint",
     label: "Checkpoint Handoff",
@@ -1489,7 +1491,7 @@ export default function (pi: ExtensionAPI) {
       });
       writeLaneDoc(ctx.cwd, lane, md);
 
-      // ── 这次到底要不要真的重置上下文（v1.3：默认 auto，不再一律清）──
+      // ── should this checkpoint really reset the context (v1.3: default auto, never blanket) ──
       const requested = pickReset(p.reset as string | undefined, DEFAULT_RESET);
       const headless = !interactive(ctx.mode);
       let kind: ResetKind = requested === "auto" ? "compact" : requested;
@@ -1570,11 +1572,11 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── 1c. 重置引擎：把 compaction 的 summary 换成刚写的 lane 文档 ──
+  // ── 1c. reset engine: feed the lane document to compaction as the summary ──
   pi.on("session_before_compact", async (event) => {
     if (!enabled) return;
-    // 只接管我们自己发起的那一次 manual compaction，
-    // 人类手打 /compact（含自定义指令）走 pi 默认逻辑。
+    // only take over the one manual compaction we started ourselves;
+    // a human /compact (with custom instructions) keeps pi's default logic.
     if (!ourCompactInFlight || !resetSummary) return;
     if (event.reason !== "manual") return;
 
@@ -1588,20 +1590,20 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // ── 1d. 水位线看门狗 + 重置派发（都在 turn_end：工具结果已落盘）──
+  // ── 1d. watermark watchdog + reset dispatch (both at turn_end: results are on disk) ──
   pi.on("turn_end", async (_event, ctx) => {
     if (!enabled) return;
-    // 1) 有存档待重置 → 优先执行重置，这一轮就不再唠叨水位线
+    // 1) a snapshot is waiting to reset -> do that first, and skip the watermark nag this turn
     if (armed && !ourCompactInFlight && resetCount < MAX_RESETS) {
       const kind = armed.kind;
       if (kind === "session") {
-        awaitingCut = true; // 交给 agent_settled 做会话替换
+        awaitingCut = true; // agent_settled performs the session replacement
         return;
       }
-      // compact：就地清空。ctx.compact() 内部会先 abort 当前 run，
-      // 所以只能在 turn_end（结果已持久化）触发，绝不能在工具 execute 里调。
-      // 正文先存到 resetSummary：实测 session_before_compact 比 agent_settled 还晚跑，
-      // 任何“在 settle 里清 armed”的写法都会把喂给 compaction 的文档清掉。
+      // compact: clear in place. ctx.compact() aborts the current run first, so it may only fire at
+      // turn_end (results already persisted) and never inside the tool's execute.
+      // the body is parked in resetSummary first: measured, session_before_compact runs later than
+      // agent_settled, so anything that clears armed in settle loses the document fed to compaction.
       resetSummary = handoffAsContext(armed.doc, armed.file);
       ourCompactInFlight = true;
       awaitingResume = true;
@@ -1613,7 +1615,7 @@ export default function (pi: ExtensionAPI) {
       ctx.compact({
         customInstructions: "Context reset to the checkpoint handoff document.",
         onError: (error: Error) => {
-          if (!ourCompactInFlight) return; // session_compact_failed 可能已经先处理过了
+          if (!ourCompactInFlight) return; // session_compact_failed may have handled it already
           ourCompactInFlight = false;
           awaitingResume = false;
           armed = null;
@@ -1627,7 +1629,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // 2) 水位线：过线即强制落盘指令
+    // 2) watermark: past the line, force the landing directive
     if (watchdogFired) return;
     const usage = ctx.getContextUsage();
     if (!usage || usage.tokens == null) return;
@@ -1640,7 +1642,8 @@ export default function (pi: ExtensionAPI) {
       `Context at ${(ratio * 100).toFixed(0)}% — forcing landing (watermark ${(WATERMARK * 100).toFixed(0)}%)`,
       "warning",
     );
-    // steer：在当前回合工具跑完、下一次 LLM 调用前插入，打断“再干一件小事”的惯性
+    // steer: injected after this turn's tools and before the next LLM call, which breaks the
+    // "one more small thing" habit
     pi.sendMessage(
       {
         customType: "handoff-chain",
@@ -1658,13 +1661,13 @@ export default function (pi: ExtensionAPI) {
     );
   });
 
-  // ── 1e. 重置收尾：把 agent 重新推起来 / 触发硬切换 ─────────────
+  // ── 1e. reset aftermath: push the agent back to work / dispatch the hard cut ──
   //
-  // 为什么用 session_compact 而不是 agent_settled 推 resume：
-  //   实测 compact() 的 abort 会先让 agent settle，compaction 本身还排在后面；
-  //   且 session_compact 时 _compactionAbortController 仍未清，此时发消息会被 pi 拒。
-  //   session_compact/_failed 是“重置确实已经跑过”的唯一可靠信号，
-  //   再用 whenIdle 轮询到状态真正干净才发。settle 里不推 resume，避免抢跑。
+  // Why session_compact and not agent_settled for the resume:
+  //   measured: compact()'s abort settles the agent first and the compaction itself comes later;
+  //   and at session_compact the _compactionAbortController is still set, so pi rejects a message.
+  //   session_compact/_failed is the only reliable signal that the reset really ran; then whenIdle
+  //   polls until the state is clean. Never resume from settle: it would jump the gun.
   pi.on("session_compact", async (event, ctx) => {
     if (!ourCompactInFlight || event.reason !== "manual") return;
     ourCompactInFlight = false;
@@ -1718,21 +1721,22 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     resetCount += 1;
-    cutArmedByTool = true; // /cut 里跳过人工确认
-    // 工具上下文里没有 newSession()，走命令通道拿带会话替换权限的 ctx。
-    // 必须 whenIdle：否则“compaction in progress”之类的拒接会直接吐掉 /cut。
+    cutArmedByTool = true; // /cut skips the human confirmation: the tool already asked for it
+    // a tool context has no newSession(), so go through the command channel for a ctx that can
+    // replace sessions. whenIdle is mandatory: a rejection such as "compaction in progress"
+    // would simply swallow the /cut.
     whenIdle(ctx, () => {
       pi.sendUserMessage("/cut", { expandPromptTemplates: true });
     }, "auto /cut");
   });
 
-  // ── 2. /next 命令：读某条 lane 的交接文档 → 全新会话接力 ────────
+  // ── 2. /next: chain a FRESH session from one lane's handoff ──────────
   //
-  // 用法： /next [lane] [-m <provider/id>|@model|model=x] [--default-model] [kickoff...]`
-  //   - lane：省略时选最近有 next task 的 lane；多条且是交互式会话时弹选择器
-  //   - 模型：默认沿用当前会话的模型（HANDOFF_CHAIN_MODEL=default 可改回 settings 默认），
-  //     `-m list` 打开模型选择器
-  //   - 其余文字作为 kickoff 覆盖默认指令
+  // usage: /next [lane] [-m <provider/id>|@model|model=x] [--default-model] [kickoff...]
+  //   - lane: defaults to the most recent lane with an open next task; when several are open and
+  //     the session is interactive, a picker is shown
+  //   - model: the chained session inherits the current model by default (HANDOFF_CHAIN_MODEL=
+  //     default` restores the old behaviour); `-m list` opens the model picker
   pi.registerCommand("next", {
     description: "Chain a FRESH session from a lane's handoff: /next [lane] [-m model] [kickoff]",
     getArgumentCompletions: (prefix: string) => {
@@ -1762,7 +1766,7 @@ export default function (pi: ExtensionAPI) {
         if (isLaneDocText(rootDoc)) legacyDoc = rootDoc;
       }
 
-      // 第一个 token 是已知 lane 名就当 lane 选择，剩下的都是 kickoff
+      // a first token that names a known lane selects it; everything else is the kickoff text
       let laneName = "";
       if (tokens[0] && LANE_NAME_RE.test(tokens[0].toLowerCase())) {
         const cand = tokens[0].toLowerCase();
@@ -1823,7 +1827,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // 人类闸门：确认后才接力（可去掉 confirm 做全自动）
+      // human gate: chain only after approval (drop the confirm for a fully automatic chain)
       await chainToFreshSession(pi, ctx, {
         doc,
         lane,
@@ -1836,10 +1840,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── 2b. /cut 命令：同一个任务，换个干净的脑子接着干 ────────────
-  // 与 /next 的区别只在语义：/next = 链到下一个任务；
-  // /cut = 上下文就地归零，同一个任务从 checkpoint 继续。
-  // checkpoint(reset:"session") 会在 settle 后自动派发 /cut。
+  // ── 2b. /cut: same task, a brand-new clean brain ─────────────────────
+  // The difference from /next is intent only: /next chains to the NEXT task;
+  // /cut zeroes the context and continues THIS task from the checkpoint.
+  // checkpoint(reset:"session") dispatches /cut automatically once the run settles.
   pi.registerCommand("cut", {
     description: "Hard context reset: fresh session from your lane's handoff, same task continues",
     handler: async (args, ctx) => {
@@ -1891,13 +1895,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── 3. /handoff 命令：人工查看交接状态 + 开关控制面 ────────────
+  // ── 3. /handoff: human view of the handoff state + the switch control plane ──
   //
-  // /handoff                 列出所有 lane（*  = 本会话的 lane）
-  // /handoff <lane>          看某条 lane 的正文
-  // /handoff all             每条 lane 的摘要 + 路径
-  // /handoff status          开关生效值 + 各级来源 + lane 列表
-  // /handoff on|off [scope]  写 enable_handoff
+  // /handoff                 list every lane (* = this session's lane)
+  // /handoff <lane>          print one lane document
+  // /handoff all             every lane: summary + path
+  // /handoff status          resolved switch value + every source + lane list
+  // /handoff on|off [scope]  write enable_handoff
   pi.registerCommand("handoff", {
     description: "List/show lanes: /handoff [lane|all] · switch: /handoff [status|on|off] [global|project]",
     getArgumentCompletions: (prefix: string) => {
@@ -1913,7 +1917,7 @@ export default function (pi: ExtensionAPI) {
       const scopeArg = (tokens[1] ?? "").toLowerCase();
       const reserved = ["status", "state", "config", "on", "off", "enable", "disable", "all"];
 
-      // /handoff —— 不带参数：列出所有 lane
+      // /handoff with no argument: list the lanes
       if (!sub) {
         migrateLegacy(ctx.cwd, ctx);
         const lanes = listLanes(ctx.cwd);
@@ -1943,7 +1947,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // /handoff <lane> —— 看某一条 lane 的正文
+      // /handoff <lane>: print that one lane document
       if (!reserved.includes(sub)) {
         migrateLegacy(ctx.cwd, ctx);
         const meta = readLane(ctx.cwd, sub);
@@ -1955,7 +1959,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // /handoff status —— 开关生效值 + 每一级来源，调优先级时靠这个
+      // /handoff status: resolved switch value and which layer wins — that is what tuning reads
       if (["status", "state", "config"].includes(sub)) {
         const show = (v: unknown) => (v === undefined ? "(absent)" : JSON.stringify(v));
         const visible = HANDOFF_TOOLS.filter((t) => pi.getActiveTools().includes(t));
@@ -1973,14 +1977,14 @@ export default function (pi: ExtensionAPI) {
                 .join(", ") || "(none)"
             }`,
             `reset floor ${(RESET_MIN * 100).toFixed(0)}% · min doc ${RESET_MIN_DOC_CHARS} chars · default reset ${DEFAULT_RESET}`,
-            `on/off 对当前会话立即生效，对其它会话在下一个 run 生效。`,
+            `on/off takes effect in this session immediately and in others on their next run.`,
           ].join("\n"),
           enabled ? "info" : "warning",
         );
         return;
       }
 
-      // /handoff all —— 每条 lane 的摘要 + 路径
+      // /handoff all: every lane's summary plus path
       if (sub === "all") {
         const lanes = listLanes(ctx.cwd);
         ctx.ui.notify(

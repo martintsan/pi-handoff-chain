@@ -211,7 +211,7 @@ async function main() {
 
   const resA = await finish.execute(
     "t1",
-    { status: "done", summary: "Task A shipped end to end.", broadcast: "A shipped\n问题: none", next_task: "" },
+    { status: "done", summary: "Task A shipped end to end.", broadcast: "A shipped\nIssues: none", next_task: "" },
     undefined,
     undefined,
     ctxA,
