@@ -3,3 +3,6 @@ node_modules/
 HANDOFF.md
 TASK.md
 *.log
+
+# lane documents from local dogfood runs
+.pi/handoff/

@@ -1,25 +1,38 @@
 #!/usr/bin/env bash
-# agent-chain.sh — Kevin 式「杀进程接力」无人值守驱动器（配合 handoff-chain.ts 扩展）
+# agent-chain.sh — unattended "kill the process, hand off through documents" driver
+# (pairs with the handoff-chain.ts pi extension)
 #
-# 用法:
-#   ./scripts/agent-chain.sh TASK.md          # 从 TASK.md 的初始终任务启动链
+# Usage:
+#   ./scripts/agent-chain.sh TASK.md            # start the chain from TASK.md's first task
+#   LANE=i18n-fix ./scripts/agent-chain.sh TASK.md
 #
-# 每轮:
-#   1. 用 kickoff 启动一个全新的 `pi -p` 进程（干净上下文，零历史包袱）
-#   2. Agent 干活，最终必须调用 finish 工具 → HANDOFF.md 落盘 + terminate:true
-#      → pi 进程干净退出（胜利巡游被杀，不浪费一个 token）
-#   3. 驱动器读 HANDOFF.md 的 "Next task"：有 → 起下一个进程接力；无 → 链结束
-#   4. 没写 HANDOFF.md 就退出 = 流程违规，链停止并告警（绝不盲目续跑）
+# Every turn:
+#   1. start a brand-new `pi -p` process with the kickoff (clean context, no baggage)
+#   2. the agent must call the finish tool → its lane document lands
+#      (.pi/handoff/<lane>.md) + terminate:true → the process exits cleanly
+#      (the victory lap is killed, no tokens wasted)
+#   3. the driver reads that lane's "Next task": non-empty → next process; empty → chain ends
+#   4. exiting without writing the lane document is a protocol violation: the chain stops
+#      and warns (never blindly continues) after one recovery attempt
+#
+# The whole run is pinned to one lane via HANDOFF_LANE so parallel drivers in the same
+# checkout cannot overwrite each other's handoff.
 
 set -euo pipefail
 
 TASK_FILE="${1:-TASK.md}"
-HANDOFF="HANDOFF.md"
-MAX_TURNS="${MAX_TURNS:-10}"     # 熔断上限，防失控烧钱
+LANE="${LANE:-$(basename "$TASK_FILE" .md | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')}"
+LANE_FILE=".pi/handoff/${LANE}.md"
+INDEX_FILE="HANDOFF.md"
+export HANDOFF_LANE="$LANE"
+MAX_TURNS="${MAX_TURNS:-10}"     # circuit breaker, stops a runaway chain
 LOG_DIR="${LOG_DIR:-.chain-logs}"
 mkdir -p "$LOG_DIR"
 
-[[ -f "$TASK_FILE" ]] || { echo "缺少起始任务文件: $TASK_FILE"; exit 1; }
+[[ -f "$TASK_FILE" ]] || { echo "missing start task file: $TASK_FILE" >&2; exit 1; }
+
+# The extension writes the lane file; a missing one means the turn never landed.
+lane_mtime() { [[ -f "$LANE_FILE" ]] && stat -f %m "$LANE_FILE" 2>/dev/null || stat -c %Y "$LANE_FILE" 2>/dev/null || echo 0; }
 
 kickoff="$(cat "$TASK_FILE")"
 turn=0
@@ -27,38 +40,40 @@ turn=0
 while [[ -n "$kickoff" ]]; do
   turn=$((turn + 1))
   if (( turn > MAX_TURNS )); then
-    echo "⚠️  达到熔断上限 MAX_TURNS=$MAX_TURNS，链停止。" >&2
+    echo "⚠️  hit the MAX_TURNS=$MAX_TURNS cap, chain stopped." >&2
     exit 2
   fi
 
-  echo "═══════ Turn $turn ═══════"
-  rm -f "$HANDOFF"
+  echo "═══════ Turn $turn · lane $LANE ═══════"
+  before="$(lane_mtime)"
 
-  # 全新进程 = 全新会话 = 干净上下文。--name 便于事后 /resume 回溯
+  # A fresh process = a fresh session = clean context. --name makes it resumable later.
   pi --name "chain-T${turn}" -p "$kickoff" 2>&1 | tee "$LOG_DIR/turn-${turn}.log"
 
-  if [[ ! -f "$HANDOFF" ]]; then
-    echo "⚠️  Turn $turn 没有写 HANDOFF.md —— 尝试恢复咒语（带残留上下文 resume 重建交接）..." >&2
-    pi --name "chain-T${turn}-recover" -c -p "你上一次运行被强制中断且未写交接文档。基于当前会话的已有内容（可能已被自动压缩）：立即重建 HANDOFF.md —— 写明 Status、已完成事项、产物路径、以及未完成的剩余工作作为 'Next task'（假设接手的全新 Agent 对本次会话毫无记忆）。重建完成后调用 finish 落盘。不要继续执行新任务，只负责重建交接。" 2>&1 | tee -a "$LOG_DIR/turn-${turn}-recover.log" || true
+  if [[ "$(lane_mtime)" == "$before" ]]; then
+    echo "⚠️  Turn $turn wrote no lane document — trying the recovery spell (resume and rebuild the handoff)..." >&2
+    pi --name "chain-T${turn}-recover" -c -p "Your previous run was interrupted and wrote no handoff document. From what is already in this session (it may have been compacted): rebuild ${LANE_FILE} right now — Status, what was done, artifact paths, and the unfinished remainder as 'Next task' (assume the agent taking over has zero memory of this session). Finish by calling the finish tool with lane: \"${LANE}\". Do not start new work; you only rebuild the handoff." 2>&1 | tee -a "$LOG_DIR/turn-${turn}-recover.log" || true
   fi
 
-  if [[ ! -f "$HANDOFF" ]]; then
-    echo "🛑 恢复失败：仍然没有 HANDOFF.md —— 链停止，需要人工介入。" >&2
+  DOC="$LANE_FILE"
+  [[ -f "$DOC" ]] || DOC="$INDEX_FILE"   # pre-lane installs wrote a single HANDOFF.md
+  if [[ ! -f "$DOC" ]]; then
+    echo "🛑 recovery failed: still no handoff document — chain stopped, needs a human." >&2
     exit 3
   fi
 
-  status="$(awk -F': ' '/^## Status$/{getline; print; exit}' "$HANDOFF")"
+  status="$(awk '/^## Status$/{getline; print; exit}' "$DOC")"
   if [[ "$status" == "blocked" ]]; then
-    echo "🛑 Turn $turn 被标记 blocked —— 链停止，需要人工介入。" >&2
+    echo "🛑 Turn $turn is marked blocked — chain stopped, needs a human." >&2
     exit 4
   fi
 
-  # 提取 "## Next task" 段落
-  kickoff="$(awk '/^## Next task/{flag=1;next}/^## /{flag=0}flag' "$HANDOFF" | sed '/(none/d' | sed '/^$/d')"
+  # extract the "## Next task" section
+  kickoff="$(awk '/^## Next task/{flag=1;next}/^## /{flag=0}flag' "$DOC" | sed '/(none/d;/^$/d')"
 
   if [[ -z "$kickoff" ]]; then
-    echo "✅ 链在第 $turn 轮完成，无后续任务。"
+    echo "✅ chain finished after $turn turn(s), no next task in lane $LANE."
   else
-    echo "→ 接力下一任务: ${kickoff:0:80}..."
+    echo "→ next task: ${kickoff:0:80}..."
   fi
 done

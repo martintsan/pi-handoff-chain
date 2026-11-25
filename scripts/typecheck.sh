@@ -18,18 +18,31 @@ fi
 PKG="node_modules/@earendil-works/pi-coding-agent"
 
 if [ ! -e "$PKG" ]; then
-  PI_BIN="$(command -v pi || true)"
-  PI_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PI_BIN:-/nonexistent}" 2>/dev/null || true)"
-  PI_PKG="${PI_REAL%/dist/*}"
+  # Locate an installed pi release that ships the types. Candidates:
+  #   1. $PI_PKG_DIR (explicit override)
+  #   2. the realpath of the `pi` binary, if it lives inside the package (…/dist/…)
+  #   3. ~/.pi/agent/install/releases/<latest>/node_modules/@earendil-works/pi-coding-agent
+  PI_PKG="${PI_PKG_DIR:-}"
+  if [ -z "$PI_PKG" ]; then
+    PI_BIN="$(command -v pi || true)"
+    PI_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${PI_BIN:-/nonexistent}" 2>/dev/null || true)"
+    case "$PI_REAL" in */dist/*) PI_PKG="${PI_REAL%/dist/*}" ;; esac
+  fi
+  if [ -z "$PI_PKG" ] || [ ! -d "$PI_PKG/dist" ]; then
+    PI_PKG="$(ls -d "${HOME}"/.pi/agent/install/releases/*/node_modules/@earendil-works/pi-coding-agent 2>/dev/null | sort -V | tail -1)"
+  fi
   if [ -z "${PI_PKG:-}" ] || [ ! -d "$PI_PKG/dist" ]; then
     echo "no pi types: run 'npm install' (peer dep) or install pi globally so they can be symlinked" >&2
     exit 1
   fi
+  ROOT="$(cd "$PI_PKG/../.." && pwd)"   # releases/<v>/node_modules
   mkdir -p node_modules/@earendil-works
   ln -sfn "$PI_PKG" "$PKG"
-  ln -sfn "$PI_PKG/node_modules/@earendil-works/pi-ai" node_modules/@earendil-works/pi-ai
-  ln -sfn "$PI_PKG/node_modules/typebox" node_modules/typebox
-  ln -sfn "$PI_PKG/node_modules/@types" node_modules/@types
+  for dep in pi-ai pi-tui pi-agent-core; do
+    [ -e "$ROOT/@earendil-works/$dep" ] && ln -sfn "$ROOT/@earendil-works/$dep" "node_modules/@earendil-works/$dep"
+  done
+  [ -e "$ROOT/typebox" ] && ln -sfn "$ROOT/typebox" node_modules/typebox
+  [ -e "$ROOT/@types" ] && ln -sfn "$ROOT/@types" node_modules/@types
   echo "linked pi types from $PI_PKG"
 fi
 

@@ -1,8 +1,17 @@
 {
   "name": "pi-handoff-chain",
-  "version": "1.2.0",
-  "description": "Kill & Handoff protocol for pi — checkpointed context resets, watermark-enforced landing, and fresh-session task chaining for multi-agent workflows",
-  "keywords": ["pi-package", "pi-extension", "multi-agent", "handoff", "context-management", "context-reset", "orchestration"],
+  "version": "1.3.0",
+  "description": "Kill & Handoff protocol for pi — per-task handoff lanes, checkpointed context resets, in-chat briefs, watermark-enforced landing, and fresh-session task chaining with model choice",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "multi-agent",
+    "handoff",
+    "context-management",
+    "context-reset",
+    "orchestration",
+    "lanes"
+  ],
   "license": "MIT",
   "files": [
     "extensions",
@@ -23,7 +32,9 @@
   },
   "scripts": {
     "typecheck": "./scripts/typecheck.sh",
-    "prepublishOnly": "./scripts/typecheck.sh"
+    "smoke": "node --no-warnings --experimental-strip-types scripts/smoke.mjs",
+    "check": "npm run typecheck && npm run smoke",
+    "prepublishOnly": "./scripts/typecheck.sh && npm run smoke"
   },
   "repository": {
     "type": "git",
@@ -32,7 +43,9 @@
   "homepage": "https://github.com/martintsan/pi-handoff-chain#readme",
   "bugs": "https://github.com/martintsan/pi-handoff-chain/issues",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
