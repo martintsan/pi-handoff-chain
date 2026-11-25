@@ -269,6 +269,15 @@ git push && git push --tags     # the tag must land, see below
 
 Tag every published version. `pi install git:...@vX` resolves git tags, so a version that exists on npm but not in git is a dead end for anyone pinning the git source — keep `v<version>` tags pointing at the exact commit whose tarball was published.
 
+### Two-factor (why a local publish can die with `EOTP`)
+
+The package owner's npm account runs 2FA in `auth-and-writes` mode, so every publish needs a one-time password. Two things trip people up:
+
+- **Registry.** If `~/.npmrc` points `registry` at a read-only mirror (e.g. npmmirror), publish must still be aimed at the real registry: `npm publish --registry https://registry.npmjs.org`. The mirror rejects writes and its token grants no publish right.
+- **TTY.** npm only offers its browser-approval flow when stdin *and* stdout are TTYs (`otplease` in `npm/lib/utils/auth.js` bails out immediately otherwise). From a CI step, a pipe, or an agent harness you get a bare `EOTP` with the auth URL masked as `***`; run the publish in a real terminal — it prints `Authenticate your account at: <url>`, waits for ENTER, opens the browser, and retries on its own once you approve. A plain 6-digit `npm publish --otp=<code>` works just as well.
+
+A publish that succeeds while npm still prints `Your package is being processed` is normal: give the registry a minute before `npm view <pkg> versions`, and match `dist.shasum` against `npm pack --dry-run` to prove the shipped tarball is the tree you gated.
+
 Gallery listing is automatic: [pi.dev/packages](https://pi.dev/packages) indexes npm packages carrying the `pi-package` keyword, which this package already has — there is nothing to submit separately. The detail page renders the package README, so README edits show up there on the next publish. For a preview in the gallery card, add `pi.image` (PNG/JPEG/GIF/WebP) or `pi.video` (MP4) to the `pi` block in `package.json`; both need a hosted URL.
 
 The catalog page sorts by download volume, so a freshly published package sits far down the list until it accumulates downloads — deep-link to `pi.dev/packages/pi-handoff-chain` rather than expecting the front page.
